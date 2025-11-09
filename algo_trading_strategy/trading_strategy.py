@@ -1,6 +1,6 @@
 import os
 import time
-from kiteconnect import KiteConnect
+from kiteconnect import KiteConnect, KiteTicker
 import pandas as pd
 import pandas_ta as ta
 
@@ -107,9 +107,58 @@ def main():
     else:
         kite.set_access_token(ACCESS_TOKEN)
 
-
-    # --- Main Loop ---
+    # --- WebSocket Connection ---
+    kws = KiteTicker(API_KEY, ACCESS_TOKEN)
     open_positions = []
+    nifty_futures_token = get_nifty_futures_instrument_token(kite)
+    if not nifty_futures_token:
+        print("Could not find Nifty futures instrument token.")
+        return
+
+    def on_ticks(ws, ticks):
+        # This function will be called for every tick
+        for tick in ticks:
+            # --- Manage Open Positions ---
+            for position in open_positions[:]:
+                if tick['instrument_token'] == position['instrument_token']:
+                    ltp = tick['last_price']
+                    profit = ltp - position['entry_price']
+
+                    if position['trailing_stoploss_price'] is None and profit >= TRAILING_STOPLOSS_INITIAL_PROFIT:
+                        position['trailing_stoploss_price'] = position['entry_price'] + 10
+                        print(f"Trailing stoploss for {position['tradingsymbol']} activated at {position['trailing_stoploss_price']}")
+
+                    if position['trailing_stoploss_price'] is not None:
+                        while profit >= position['trailing_stoploss_price'] - position['entry_price'] + TRAILING_STOPLOSS_INCREMENT:
+                            position['trailing_stoploss_price'] += TRAILING_STOPLOSS_INCREMENT
+                            print(f"Trailing stoploss for {position['tradingsymbol']} updated to {position['trailing_stoploss_price']}")
+
+                    if (position['trailing_stoploss_price'] is not None and ltp <= position['trailing_stoploss_price']) or \
+                       (ltp <= position['stoploss_price']):
+                        kite.place_order(
+                            variety=kite.VARIETY_REGULAR,
+                            exchange=kite.EXCHANGE_NFO,
+                            tradingsymbol=position['tradingsymbol'],
+                            transaction_type=kite.TRANSACTION_TYPE_SELL,
+                            quantity=LOT_SIZE * position['lot_size'],
+                            product=kite.PRODUCT_MIS,
+                            order_type=kite.ORDER_TYPE_MARKET
+                        )
+                        print(f"Position closed for {position['tradingsymbol']}.")
+                        open_positions.remove(position)
+                        ws.unsubscribe([position['instrument_token']])
+
+
+    def on_connect(ws, response):
+        # This function will be called once the connection is established
+        ws.subscribe([nifty_futures_token])
+        ws.set_mode(ws.MODE_FULL, [nifty_futures_token])
+
+    kws.on_ticks = on_ticks
+    kws.on_connect = on_connect
+    kws.connect(threaded=True)
+
+    # --- Main Loop for Entry Conditions ---
     last_candle_timestamp = None
     while True:
         try:
@@ -129,15 +178,10 @@ def main():
                         )
                         print(f"Closing position for {position['tradingsymbol']} at end of day.")
                         open_positions.remove(position)
-                time.sleep(60)  # Sleep for a minute
+                time.sleep(60)
                 continue
 
             # --- Get Nifty Futures Data ---
-            nifty_futures_token = get_nifty_futures_instrument_token(kite)
-            if not nifty_futures_token:
-                print("Could not find Nifty futures instrument token.")
-                return
-
             historical_data = kite.historical_data(
                 instrument_token=nifty_futures_token,
                 from_date=(pd.to_datetime('today') - pd.DateOffset(days=5)).strftime('%Y-%m-%d'),
@@ -158,12 +202,11 @@ def main():
             df_ha.ta.bbands(length=BB_LENGTH, std=BB_STDDEV, append=True)
             df_ha.ta.supertrend(period=ST_PERIOD, multiplier=ST_MULTIPLIER, append=True)
 
-
             # --- Entry Conditions ---
             latest_candle = df_ha.iloc[-1]
             if (latest_candle['HA_Close'] > latest_candle['HA_Open'] and
                     latest_candle['HA_Close'] > latest_candle[f'BBM_{BB_LENGTH}_{float(BB_STDDEV)}'] and
-                    latest_candle['HA_Close'] > latest_candle[f'SUPERT_{ST_PERIOD}_{float(ST_MULTIPLIER)}']) and not open_positions:
+                    latest_candle['HA_Close'] > latest_candle[f'SUPERT_{ST_PERIOD}_{float(ST_MULTIPLIER)}']):
 
                 # --- Find Option Contract ---
                 nifty_ltp = kite.ltp([nifty_futures_token])[str(nifty_futures_token)]['last_price']
@@ -183,49 +226,23 @@ def main():
 
                 # --- Add to open positions ---
                 entry_price = kite.ltp([option_contract['instrument_token']])[str(option_contract['instrument_token'])]['last_price']
-                open_positions.append({
+                position = {
                     'instrument_token': option_contract['instrument_token'],
                     'tradingsymbol': option_contract['tradingsymbol'],
                     'lot_size': option_contract['lot_size'],
                     'entry_price': entry_price,
                     'stoploss_price': entry_price - STOPLOSS_POINTS,
                     'trailing_stoploss_price': None
-                })
+                }
+                open_positions.append(position)
+                kws.subscribe([position['instrument_token']])
+                kws.set_mode(kws.MODE_FULL, [position['instrument_token']])
 
-            # --- Manage Open Positions ---
-            for position in open_positions[:]:
-                ltp = kite.ltp([position['instrument_token']])[str(position['instrument_token'])]['last_price']
-                profit = ltp - position['entry_price']
-
-                if position['trailing_stoploss_price'] is None and profit >= TRAILING_STOPLOSS_INITIAL_PROFIT:
-                    position['trailing_stoploss_price'] = position['entry_price'] + 10
-                    print(f"Trailing stoploss for {position['tradingsymbol']} activated at {position['trailing_stoploss_price']}")
-
-                if position['trailing_stoploss_price'] is not None:
-                    while profit >= position['trailing_stoploss_price'] - position['entry_price'] + TRAILING_STOPLOSS_INCREMENT:
-                        position['trailing_stoploss_price'] += TRAILING_STOPLOSS_INCREMENT
-                        print(f"Trailing stoploss for {position['tradingsymbol']} updated to {position['trailing_stoploss_price']}")
-
-                if (position['trailing_stoploss_price'] is not None and ltp <= position['trailing_stoploss_price']) or \
-                   (ltp <= position['stoploss_price']):
-                    kite.place_order(
-                        variety=kite.VARIETY_REGULAR,
-                        exchange=kite.EXCHANGE_NFO,
-                        tradingsymbol=position['tradingsymbol'],
-                        transaction_type=kite.TRANSACTION_TYPE_SELL,
-                        quantity=LOT_SIZE * position['lot_size'],
-                        product=kite.PRODUCT_MIS,
-                        order_type=kite.ORDER_TYPE_MARKET
-                    )
-                    print(f"Position closed for {position['tradingsymbol']}.")
-                    open_positions.remove(position)
-
-            # --- Sleep until the next candle ---
-            time.sleep(1)
 
         except Exception as e:
             print(f"An error occurred: {e}")
             time.sleep(60)
+
 
 if __name__ == "__main__":
     main()

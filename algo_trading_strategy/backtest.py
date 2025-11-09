@@ -11,6 +11,15 @@ STOPLOSS_POINTS = 15
 TRAILING_STOPLOSS_INITIAL_PROFIT = 10
 TRAILING_STOPLOSS_INCREMENT = 3
 
+def get_option_price(underlying_price, strike_price, option_type='CE'):
+    """A dummy function to simulate option prices."""
+    # This is a highly simplified model. In reality, option prices are
+    # determined by complex models like Black-Scholes.
+    if option_type == 'CE':
+        return max(0, underlying_price - strike_price)
+    else:
+        return max(0, strike_price - underlying_price)
+
 def backtest(df):
     """Backtests the trading strategy on historical data."""
     capital = INITIAL_CAPITAL
@@ -24,18 +33,23 @@ def backtest(df):
                 df['HA_Close'][i] > df[f'SUPERT_10_2.0'][i]):
 
             # --- Enter a simulated position ---
-                entry_price = df['close'][i]
-                positions.append({
-                    'entry_price': entry_price,
-                    'entry_time': df.index[i],
-                    'stoploss_price': entry_price - STOPLOSS_POINTS,
-                    'trailing_stoploss_price': None
-                })
+            underlying_price = df['close'][i]
+            strike_price = round(underlying_price / 100) * 100
+            entry_price = get_option_price(underlying_price, strike_price)
+
+            positions.append({
+                'entry_price': entry_price,
+                'entry_time': df.index[i],
+                'stoploss_price': entry_price - STOPLOSS_POINTS,
+                'trailing_stoploss_price': None,
+                'strike_price': strike_price
+            })
 
         # --- Exit Conditions ---
         elif positions:
-            ltp = df['close'][i]
+            underlying_price = df['close'][i]
             for p in positions:
+                ltp = get_option_price(underlying_price, p['strike_price'])
                 profit = ltp - p['entry_price']
 
                 if p['trailing_stoploss_price'] is None and profit >= TRAILING_STOPLOSS_INITIAL_PROFIT:
@@ -68,14 +82,7 @@ def main():
     # --- Load Sample Data ---
     # In a real scenario, you would fetch historical data from your broker
     # or a data provider. For this example, we'll create a sample CSV.
-    data = {
-        'date': pd.to_datetime(pd.date_range(start='2023-01-02 09:15:00', periods=100, freq='5T')),
-        'open': 18000 + (np.random.randn(100) * 5).cumsum(),
-        'high': 18000 + (np.random.randn(100) * 5).cumsum() + np.random.randint(0, 10, 100),
-        'low': 18000 + (np.random.randn(100) * 5).cumsum() - np.random.randint(0, 10, 100),
-        'close': 18000 + (np.random.randn(100) * 5).cumsum(),
-    }
-    df = pd.DataFrame(data).set_index('date')
+    df = pd.read_csv('algo_trading_strategy/historical_data.csv', parse_dates=['date'], index_col='date')
 
 
     # --- Calculate Indicators ---
